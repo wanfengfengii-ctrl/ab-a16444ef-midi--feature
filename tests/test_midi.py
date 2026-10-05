@@ -6,11 +6,14 @@ from fractions import Fraction
 from app.midi import (
     MAX_TRACKS_PLUS_EVENTS,
     MidiError,
+    build_metric_segments,
     build_tempo_segments,
+    musical_position_at_tick,
     normalize,
     parse,
     time_at_tick,
     TempoEvent,
+    TimeSignatureEvent,
 )
 
 
@@ -42,6 +45,13 @@ def header(fmt, ntracks, division):
 
 def tempo(delta, us):
     return varlen(delta) + bytes([0xFF, 0x51, 0x03]) + us.to_bytes(3, "big")
+
+
+def timesig(delta, numerator, denom_exp, cc=24, bb=8):
+    return (
+        varlen(delta)
+        + bytes([0xFF, 0x58, 0x04, numerator, denom_exp, cc, bb])
+    )
 
 
 def ev(delta, *bs):
@@ -344,6 +354,243 @@ class TempoTests(unittest.TestCase):
         data = header(1, 2, 480) + track(conductor) + track(notes)
         result = normalize(data)
         self.assertEqual(fractions(result), [Fraction(500000)])
+
+
+# -- musical position projection ---------------------------------------------
+
+
+def positions(result):
+    return [
+        (
+            e["musical_position"]["measure"],
+            (
+                e["musical_position"]["time_signature"]["numerator"],
+                e["musical_position"]["time_signature"]["denominator"],
+            ),
+            e["musical_position"]["beat"]["fraction"],
+        )
+        for e in result["events"]
+    ]
+
+
+class MusicalPositionTests(unittest.TestCase):
+    def test_default_4_4_whole_bars(self):
+        # PPQN 480: beat = 480 ticks, bar = 1920 ticks.
+        payload = (
+            ev(0, 0x90, 60, 100)       # tick 0    m1 beat 1
+            + ev(480, 0x80, 60, 0)     # tick 480  m1 beat 2
+            + ev(960, 0x90, 62, 100)   # tick 1440 m1 beat 4
+            + ev(480, 0x80, 62, 0)     # tick 1920 m2 beat 1
+            + ev(1920, 0x90, 64, 100)  # tick 3840 m3 beat 1
+            + EOT
+        )
+        result = normalize(header(1, 1, 480) + track(payload),
+                           musical_position=True)
+        self.assertEqual(
+            positions(result),
+            [(1, (4, 4), "1/1"), (1, (4, 4), "2/1"), (1, (4, 4), "4/1"),
+             (2, (4, 4), "1/1"), (3, (4, 4), "1/1")],
+        )
+
+    def test_fractional_beat_positions(self):
+        # PPQN 480: 240 ticks is a half beat -> beat 3/2; 241 ticks -> 1441/1440.
+        payload = (
+            ev(240, 0x90, 60, 100)
+            + ev(1, 0x80, 60, 0)
+            + EOT
+        )
+        result = normalize(header(0, 1, 480) + track(payload),
+                           musical_position=True)
+        self.assertEqual(
+            [p[2] for p in positions(result)],
+            ["3/2", "721/480"],
+        )
+
+    def test_explicit_time_signature_at_zero(self):
+        conductor = timesig(0, 3, 1) + EOT  # 3/2: beat = half note (960 ticks)
+        notes = (
+            ev(0, 0x90, 60, 100)      # tick 0    m1 beat 1
+            + ev(960, 0x80, 60, 0)    # tick 960  m1 beat 2
+            + ev(960, 0x90, 62, 100)  # tick 1920 m1 beat 3 (bar = 2880)
+            + ev(960, 0x80, 62, 0)    # tick 2880 m2 beat 1
+            + EOT
+        )
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, musical_position=True)
+        self.assertEqual(
+            positions(result),
+            [(1, (3, 2), "1/1"), (1, (3, 2), "2/1"),
+             (1, (3, 2), "3/1"), (2, (3, 2), "1/1")],
+        )
+
+    def test_meter_change_on_bar_line(self):
+        # 4/4 for one full bar, 3/4 from tick 1920 (a clean boundary).
+        conductor = timesig(0, 4, 2) + timesig(1920, 3, 2) + EOT
+        notes = (
+            ev(1920, 0x90, 60, 60)   # m2 beat 1 in 3/4
+            + ev(1440, 0x80, 60, 0)  # m3 beat 1 (3/4 bar = 1440)
+            + EOT
+        )
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, musical_position=True)
+        self.assertEqual(
+            positions(result),
+            [(2, (3, 4), "1/1"), (3, (3, 4), "1/1")],
+        )
+
+    def test_midbar_change_truncates_and_counts_short_bar(self):
+        # 4/4 at tick 0; 6/8 declared mid-bar at tick 720 (halfway through
+        # beat 2).  The unfinished 4/4 bar still counts as measure 1, so the
+        # 6/8 segment starts at measure 2.  Beats are denominator-note beats:
+        # in 6/8 an eighth note (240 ticks at PPQN 480), six per 1440-tick bar.
+        conductor = (
+            timesig(0, 4, 2)
+            + timesig(720, 6, 3)  # denominator exponent 3 -> 8
+            + EOT
+        )
+        notes = (
+            ev(0, 0x90, 60, 100)      # tick 0    m1 b1, meter 4/4
+            + ev(480, 0x90, 61, 100)  # tick 480  m1 b2
+            + ev(240, 0x90, 62, 100)  # tick 720  m2 b1, meter 6/8
+            + ev(240, 0x90, 63, 100)  # tick 960  m2 b2
+            + ev(1200, 0x90, 64, 100)  # tick 2160 m3 b1 (6/8 bar 1440)
+            + EOT
+        )
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, musical_position=True)
+        self.assertEqual(
+            positions(result),
+            [
+                (1, (4, 4), "1/1"),
+                (1, (4, 4), "2/1"),
+                (2, (6, 8), "1/1"),
+                (2, (6, 8), "2/1"),
+                (3, (6, 8), "1/1"),
+            ],
+        )
+
+    def test_events_before_midbar_change_keep_old_meter(self):
+        conductor = timesig(0, 4, 2) + timesig(960, 2, 2) + EOT
+        notes = (
+            ev(720, 0x90, 60, 100)   # tick 720: m1 b2.5 in 4/4
+            + ev(240, 0x80, 60, 0)   # tick 960: change tick -> 2/4 m2 b1
+            + EOT
+        )
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, musical_position=True)
+        self.assertEqual(
+            positions(result),
+            [(1, (4, 4), "5/2"), (2, (2, 4), "1/1")],
+        )
+
+    def test_same_tick_last_declaration_wins(self):
+        conductor = (
+            timesig(0, 3, 2)      # 3/4 first
+            + timesig(0, 6, 3)    # 6/8 last -> wins
+            + EOT
+        )
+        notes = ev(0, 0x90, 60, 100) + ev(720, 0x80, 60, 0) + EOT
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, musical_position=True)
+        # 6/8: eighth-note beats 240 ticks apart -> tick 720 is beat 4.
+        self.assertEqual(
+            positions(result),
+            [(1, (6, 8), "1/1"), (1, (6, 8), "4/1")],
+        )
+
+    def test_format_1_ignores_time_signatures_on_other_tracks(self):
+        conductor = timesig(0, 4, 2) + EOT
+        notes = timesig(0, 7, 3) + ev(480, 0x90, 60, 100) + EOT
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, musical_position=True)
+        self.assertEqual(
+            positions(result), [(1, (4, 4), "2/1")]
+        )
+
+    def test_non_integer_beats_per_bar_exact(self):
+        # 1/1 at PPQN 48: bar = beat = 192 ticks.
+        conductor = timesig(0, 1, 0) + EOT
+        notes = ev(48, 0x90, 60, 100) + ev(144, 0x80, 60, 0) + EOT
+        data = header(1, 2, 48) + track(conductor) + track(notes)
+        result = normalize(data, musical_position=True)
+        self.assertEqual(
+            positions(result),
+            [(1, (1, 1), "5/4"), (2, (1, 1), "1/1")],
+        )
+
+    def test_metric_segment_helpers(self):
+        events = [
+            TimeSignatureEvent(0, 3, 4, 0),
+            TimeSignatureEvent(0, 2, 4, 5),   # same tick -> last wins
+            TimeSignatureEvent(480, 6, 8, 9),
+        ]
+        segments = build_metric_segments(events)
+        self.assertEqual(segments, [(0, 2, 4), (480, 6, 8)])
+        # Tick 479 in the short 2/4 opening bar: m1, beat ~1.998.
+        measure, num, den, beat = musical_position_at_tick(479, segments, 480)
+        self.assertEqual((measure, num, den), (1, 2, 4))
+        self.assertEqual(beat, Fraction(1) + Fraction(479, 480))
+        # Tick 480 opens measure 2 in 6/8.
+        measure, num, den, beat = musical_position_at_tick(480, segments, 480)
+        self.assertEqual((measure, num, den, beat), (2, 6, 8, Fraction(1)))
+
+    # -- strict validation (projection only) ------------------------------
+
+    def _ts_payload(self, raw_bytes, delta=0):
+        return varlen(delta) + raw_bytes
+
+    def test_bad_time_signature_length(self):
+        raw = bytes([0xFF, 0x58, 0x03, 4, 2, 24])  # one byte short
+        payload = self._ts_payload(raw) + EOT
+        with self.assertRaises(MidiError) as ctx:
+            parse(header(0, 1, 480) + track(payload),
+                  strict_time_signatures=True)
+        self.assertEqual(ctx.exception.code, "bad_time_signature")
+        self.assertEqual(ctx.exception.offset, 23)  # status byte offset
+
+    def test_zero_numerator_rejected(self):
+        payload = timesig(0, 0, 0) + EOT
+        with self.assertRaises(MidiError) as ctx:
+            parse(header(0, 1, 480) + track(payload),
+                  strict_time_signatures=True)
+        self.assertEqual(ctx.exception.code, "invalid_time_signature")
+
+    def test_denominator_exponent_above_7_rejected(self):
+        payload = timesig(0, 4, 8) + EOT  # 2^8 = 256th note
+        with self.assertRaises(MidiError) as ctx:
+            parse(header(0, 1, 480) + track(payload),
+                  strict_time_signatures=True)
+        self.assertEqual(ctx.exception.code, "invalid_time_signature")
+
+    def test_denominator_exponent_boundaries_accepted(self):
+        for exponent in (0, 7):
+            payload = timesig(0, 1, exponent) + EOT
+            parsed = parse(header(0, 1, 480) + track(payload),
+                           strict_time_signatures=True)
+            self.assertEqual(parsed.time_signature_events[0].denominator,
+                             1 << exponent)
+
+    def test_bad_time_signature_rejected_file_wide(self):
+        conductor = EOT
+        notes = timesig(0, 4, 9) + EOT  # bad even on a non-governing track
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        with self.assertRaises(MidiError) as ctx:
+            parse(data, strict_time_signatures=True)
+        self.assertEqual(ctx.exception.code, "invalid_time_signature")
+
+    def test_legacy_mode_skips_time_signature_checks(self):
+        # Malformed (3-byte) and weird (denom 256) events: fine without the
+        # projection, and the response gains no musical_position field.
+        conductor = (
+            bytes([0x00, 0xFF, 0x58, 0x03, 4, 2, 24])
+            + timesig(0, 4, 8)
+            + EOT
+        )
+        notes = ev(480, 0x90, 60, 100) + EOT
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data)
+        self.assertNotIn("musical_position", result["events"][0])
+        self.assertEqual(result["events"][0]["tick"], 480)
 
 
 # -- ordering ----------------------------------------------------------------

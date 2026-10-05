@@ -3,8 +3,12 @@
 Runs, in order:
   1. code tests   -- the unit-test suite (stdlib unittest)
   2. build check  -- byte-compile every source tree and import the modules
-  3. API smoke    -- POST a multi-track, tempo-changing format-1 file plus
-                     structural-error cases to a healthy app container
+  3. app health   -- wait for the app container's health check to pass
+  4. API smoke    -- the original PPQN regression: POST a multi-track,
+                     tempo-changing format-1 file plus structural-error cases
+  5. projection   -- POST with projection=musical_position, including a
+                     cross-bar meter change, decoy meters on other tracks,
+                     strict time-signature errors and legacy compatibility
 
 Every step is reported on stdout; the process exit code is 0 only when all
 steps pass, so `docker compose up --exit-code-from verify verify` surfaces
@@ -51,6 +55,13 @@ def header(fmt, ntracks, division):
 
 def tempo(delta, us):
     return varlen(delta) + bytes([0xFF, 0x51, 0x03]) + us.to_bytes(3, "big")
+
+
+def timesig(delta, numerator, denom_exp, cc=24, bb=8):
+    return (
+        varlen(delta)
+        + bytes([0xFF, 0x58, 0x04, numerator, denom_exp, cc, bb])
+    )
 
 
 def ev(delta, *bs):
@@ -105,12 +116,51 @@ EXPECTED_EVENTS = [
 ]
 
 
+def build_meter_file():
+    """Format 1, PPQN 480, with cross-bar meter changes on track 0.
+
+    4/4 at tick 0; 6/8 declared mid-bar at tick 720 (the unfinished bar
+    still counts as measure 1); 3/4 at tick 2160, a clean 6/8 bar boundary.
+    Track 1 carries the note events positioned around those changes.
+    """
+    conductor = (
+        timesig(0, 4, 2)       # tick 0    4/4
+        + timesig(720, 6, 3)   # tick 720  6/8, mid-bar change
+        + timesig(1440, 3, 2)  # tick 2160 3/4 on a 6/8 bar line
+        + EOT
+    )
+    notes = (
+        ev(0, 0x90, 60, 100)     # tick 0    m1 b1 4/4
+        + ev(480, 0x90, 61, 100)  # tick 480  m1 b2 4/4
+        + ev(240, 0x90, 62, 100)  # tick 720  m2 b1 6/8
+        + ev(240, 0x90, 63, 100)  # tick 960  m2 b2 6/8
+        + ev(1200, 0x90, 64, 100)  # tick 2160 m3 b1 3/4
+        + ev(240, 0x90, 65, 100)  # tick 2400 m3 b3/2 3/4
+        + ev(480, 0x90, 67, 100)  # tick 2880 m3 b5/2 3/4
+        + EOT
+    )
+    return header(1, 2, 480) + track(conductor) + track(notes)
+
+
+# (tick, measure, (numerator, denominator), beat fraction)
+EXPECTED_MUSICAL_POSITIONS = [
+    (0, 1, (4, 4), "1/1"),
+    (480, 1, (4, 4), "2/1"),
+    (720, 2, (6, 8), "1/1"),
+    (960, 2, (6, 8), "2/1"),
+    (2160, 3, (3, 4), "1/1"),
+    (2400, 3, (3, 4), "3/2"),
+    (2880, 3, (3, 4), "5/2"),
+]
+
+
 # -- helpers -----------------------------------------------------------------
 
 
-def post(body):
+def post(body, query=""):
+    url = APP_URL + "/api/midi/normalize" + query
     request = urllib.request.Request(
-        APP_URL + "/api/midi/normalize",
+        url,
         data=body,
         headers={"Content-Type": "application/octet-stream"},
         method="POST",
@@ -153,7 +203,7 @@ class Suite:
 
 
 def step_unit_tests():
-    print("[1/4] code tests: unittest suite", flush=True)
+    print("[1/5] code tests: unittest suite", flush=True)
     result = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
         capture_output=True,
@@ -166,7 +216,7 @@ def step_unit_tests():
 
 
 def step_build_check():
-    print("[2/4] build check: byte-compile and import all modules", flush=True)
+    print("[2/5] build check: byte-compile and import all modules", flush=True)
     result = subprocess.run(
         [sys.executable, "-m", "compileall", "-q", "app", "tests", "verify"],
         capture_output=True,
@@ -186,14 +236,14 @@ def step_build_check():
 
 
 def step_wait_for_app():
-    print(f"[3/4] waiting for app health at {APP_URL}/health", flush=True)
+    print(f"[3/5] waiting for app health at {APP_URL}/health", flush=True)
     ok = wait_for_app()
     print("      healthy" if ok else "      NOT healthy", flush=True)
     return ok
 
 
 def step_api_smoke():
-    print("[4/4] API smoke: multi-track tempo-changing file + error cases",
+    print("[4/5] API smoke: multi-track tempo-changing file + error cases",
           flush=True)
     suite = Suite()
 
@@ -277,6 +327,150 @@ def step_api_smoke():
     return not suite.failures
 
 
+PROJECTION_QUERY = "?projection=musical_position"
+
+
+def step_projection_smoke():
+    print("[5/5] projection smoke: musical positions across meter changes",
+          flush=True)
+    suite = Suite()
+
+    # -- happy path: cross-bar meter changes -------------------------------
+    status, body = post(build_meter_file(), PROJECTION_QUERY)
+    suite.check("status 200", status == 200, f"got {status}: {body}")
+    if status != 200:
+        return False
+    events = body.get("events", [])
+    suite.check("7 events returned", len(events) == 7, f"got {len(events)}")
+    for i, expected in enumerate(EXPECTED_MUSICAL_POSITIONS):
+        if i >= len(events):
+            break
+        tick, measure, (num, den), beat = expected
+        got = events[i].get("musical_position", {})
+        suite.check(
+            f"tick {tick}: measure {measure}",
+            got.get("measure") == measure,
+            f"got {got.get('measure')}",
+        )
+        suite.check(
+            f"tick {tick}: time signature {num}/{den}",
+            got.get("time_signature") == {"numerator": num, "denominator": den},
+            f"got {got.get('time_signature')}",
+        )
+        suite.check(
+            f"tick {tick}: beat {beat}",
+            got.get("beat", {}).get("fraction") == beat,
+            f"got {got.get('beat')}",
+        )
+
+    # -- microsecond timeline unchanged and still present -------------------
+    by_tick = {e["tick"]: e for e in events}
+    # tick 2160 under default tempo: 2160 * 500000 / 480 = 2250000 us.
+    suite.check(
+        "exact time_us retained",
+        by_tick[2160]["time_us"]["fraction"] == "2250000/1",
+        f"got {by_tick[2160]['time_us']}",
+    )
+    keys = [(e["tick"], e["track"], e["order"]) for e in events]
+    suite.check("events sorted by (tick, track, order)", keys == sorted(keys))
+
+    # -- decoy time signatures on non-governing tracks are ignored ----------
+    conductor = timesig(0, 4, 2) + EOT
+    strings = timesig(0, 7, 3) + ev(480, 0x91, 65, 100) + EOT
+    decoy = header(1, 2, 480) + track(conductor) + track(strings)
+    status, body = post(decoy, PROJECTION_QUERY)
+    mp = body["events"][0]["musical_position"]
+    suite.check(
+        "other-track meter ignored",
+        mp["time_signature"] == {"numerator": 4, "denominator": 4}
+        and mp["beat"]["fraction"] == "2/1",
+        f"got {mp}",
+    )
+
+    # -- same-tick last declaration wins ------------------------------------
+    conductor = timesig(0, 3, 2) + timesig(0, 2, 2) + EOT  # 3/4 then 2/4
+    notes = ev(480, 0x90, 60, 100) + EOT
+    same_tick = header(1, 2, 480) + track(conductor) + track(notes)
+    status, body = post(same_tick, PROJECTION_QUERY)
+    mp = body["events"][0]["musical_position"]
+    suite.check(
+        "same tick last meter wins",
+        mp["time_signature"] == {"numerator": 2, "denominator": 4}
+        and mp["beat"]["fraction"] == "2/1",
+        f"got {mp}",
+    )
+
+    # -- strict time-signature errors: 400 + offset, no partial timeline ----
+    error_cases = [
+        (
+            "3-byte time signature",
+            header(0, 1, 480)
+            + track(bytes([0x00, 0xFF, 0x58, 0x03, 4, 2, 24]) + EOT),
+            "bad_time_signature",
+        ),
+        (
+            "5-byte time signature",
+            header(0, 1, 480)
+            + track(
+                varlen(0) + bytes([0xFF, 0x58, 0x05, 4, 2, 24, 8, 0]) + EOT
+            ),
+            "bad_time_signature",
+        ),
+        (
+            "zero numerator",
+            header(0, 1, 480) + track(timesig(0, 0, 2) + EOT),
+            "invalid_time_signature",
+        ),
+        (
+            "denominator exponent 8",
+            header(0, 1, 480) + track(timesig(0, 4, 8) + EOT),
+            "invalid_time_signature",
+        ),
+    ]
+    for label, payload, code in error_cases:
+        status, resp = post(payload, PROJECTION_QUERY)
+        err = resp.get("error", {})
+        suite.check(f"{label}: HTTP 400", status == 400, f"got {status}")
+        suite.check(f"{label}: code {code}", err.get("code") == code,
+                    f"got {err.get('code')}")
+        suite.check(
+            f"{label}: locating offset",
+            isinstance(err.get("offset"), int) and err["offset"] >= 0,
+            f"got {err.get('offset')}",
+        )
+        suite.check(f"{label}: no partial timeline", "events" not in resp)
+
+    # -- malformed meter accepted without the projection --------------------
+    odd = header(0, 1, 480) + track(
+        bytes([0x00, 0xFF, 0x58, 0x03, 4, 2, 24])
+        + ev(480, 0x90, 60, 100)
+        + EOT
+    )
+    status, body = post(odd)
+    suite.check("malformed meter accepted without projection", status == 200,
+                f"got {status}: {body}")
+    if status == 200:
+        legacy_events = body.get("events", [])
+        suite.check(
+            "legacy response has no musical_position",
+            bool(legacy_events)
+            and all("musical_position" not in e for e in legacy_events),
+            f"got {legacy_events}",
+        )
+
+    # -- unknown projection rejected before body processing -----------------
+    status, resp = post(build_meter_file(), "?projection=other")
+    suite.check("unknown projection: HTTP 400", status == 400,
+                f"got {status}")
+    suite.check(
+        "unknown projection: code",
+        resp.get("error", {}).get("code") == "invalid_projection",
+        f"got {resp}",
+    )
+
+    return not suite.failures
+
+
 def main():
     print(f"verify: target app at {APP_URL}", flush=True)
     steps = [
@@ -284,6 +478,7 @@ def main():
         ("build check", step_build_check),
         ("app health", step_wait_for_app),
         ("api smoke", step_api_smoke),
+        ("projection smoke", step_projection_smoke),
     ]
     failed = []
     for name, fn in steps:

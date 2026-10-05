@@ -30,7 +30,10 @@ CHANNEL_EVENT_NAMES = {
 }
 
 _META_TEMPO = 0x51
+_META_TIME_SIGNATURE = 0x58
 _META_END_OF_TRACK = 0x2F
+
+DEFAULT_TIME_SIGNATURE = (4, 4)
 
 
 class MidiError(Exception):
@@ -60,12 +63,23 @@ class TempoEvent:
 
 
 @dataclass
+class TimeSignatureEvent:
+    tick: int
+    numerator: int
+    denominator: int  # actual note value, e.g. 4 for a quarter-note beat
+    offset: int  # byte offset of the event's status byte
+
+
+@dataclass
 class ParsedMidi:
     fmt: int
     ppqn: int
     ntracks: int
     channel_events: List[ChannelEvent] = field(default_factory=list)
     tempo_events: List[TempoEvent] = field(default_factory=list)  # track 0 only
+    time_signature_events: List[TimeSignatureEvent] = field(
+        default_factory=list
+    )  # track 0 only; meaningful solely under the musical_position projection
 
 
 def _read_varlen(data: bytes, pos: int, end: int) -> Tuple[int, int]:
@@ -91,8 +105,15 @@ def _read_varlen(data: bytes, pos: int, end: int) -> Tuple[int, int]:
     )
 
 
-def parse(data: bytes) -> ParsedMidi:
-    """Parse and strictly validate a whole SMF file."""
+def parse(data: bytes, *, strict_time_signatures: bool = False) -> ParsedMidi:
+    """Parse and strictly validate a whole SMF file.
+
+    When ``strict_time_signatures`` is set (the musical-position projection),
+    time-signature meta events on the governing track must be exactly four
+    bytes with a positive numerator and a denominator exponent in 0..7.
+    Without it, such events are accepted unchecked and do not affect output,
+    so the legacy request/response contract is untouched.
+    """
     if len(data) > MAX_FILE_BYTES:
         raise MidiError(
             "file_too_large",
@@ -173,7 +194,14 @@ def parse(data: bytes) -> ParsedMidi:
                 f"{pos + 4} exceeds the {len(data) - track_start} remaining bytes",
                 pos + 4,
             )
-        _parse_track(data, track_start, track_end, track_index, parsed)
+        _parse_track(
+            data,
+            track_start,
+            track_end,
+            track_index,
+            parsed,
+            strict_time_signatures,
+        )
         pos = track_end
     if pos != len(data):
         raise MidiError(
@@ -185,7 +213,12 @@ def parse(data: bytes) -> ParsedMidi:
 
 
 def _parse_track(
-    data: bytes, start: int, end: int, track_index: int, parsed: ParsedMidi
+    data: bytes,
+    start: int,
+    end: int,
+    track_index: int,
+    parsed: ParsedMidi,
+    strict_time_signatures: bool = False,
 ) -> None:
     pos = start
     tick = 0
@@ -297,6 +330,47 @@ def _parse_track(
                 # format 0 that is also the only track, so the rule is uniform.
                 if track_index == 0:
                     parsed.tempo_events.append(TempoEvent(tick=tick, tempo_us=tempo_us))
+            elif meta_type == _META_TIME_SIGNATURE:
+                # Under the musical-position projection every time-signature
+                # event in the file must be well-formed (mirroring the
+                # file-wide tempo checks), but only the governing first
+                # track's events build the metric map.  Without the
+                # projection these events are accepted unchecked and stay
+                # invisible, preserving the legacy contract.
+                if strict_time_signatures:
+                    if meta_len != 4:
+                        raise MidiError(
+                            "bad_time_signature",
+                            f"track {track_index}: time signature meta event at "
+                            f"offset {status_offset} must be 4 bytes, got {meta_len}",
+                            status_offset,
+                        )
+                    numerator = payload[0]
+                    denom_exp = payload[1]
+                    if numerator == 0:
+                        raise MidiError(
+                            "invalid_time_signature",
+                            f"track {track_index}: time signature at offset "
+                            f"{status_offset} has a zero numerator",
+                            status_offset,
+                        )
+                    if denom_exp > 7:
+                        raise MidiError(
+                            "invalid_time_signature",
+                            f"track {track_index}: time signature at offset "
+                            f"{status_offset} has denominator exponent {denom_exp}, "
+                            "must be between 0 and 7",
+                            status_offset,
+                        )
+                    if track_index == 0:
+                        parsed.time_signature_events.append(
+                            TimeSignatureEvent(
+                                tick=tick,
+                                numerator=numerator,
+                                denominator=1 << denom_exp,
+                                offset=status_offset,
+                            )
+                        )
             elif meta_type == _META_END_OF_TRACK and meta_len != 0:
                 raise MidiError(
                     "bad_meta_length",
@@ -356,31 +430,119 @@ def time_at_tick(
     return total
 
 
-def normalize(data: bytes) -> dict:
-    """Parse ``data`` and return the normalized channel-event timeline."""
-    parsed = parse(data)
+def build_metric_segments(
+    events: List[TimeSignatureEvent],
+) -> List[Tuple[int, int, int]]:
+    """Build ``(start_tick, numerator, denominator)`` metric segments.
+
+    Events come from the single governing track (the only track for format
+    0, the first track for format 1) in tick order.  Several declarations at
+    one tick collapse to the last one.  A declaration at a later tick begins
+    a fresh bar there even when the previous bar is unfinished; such a short
+    bar is still counted (it keeps its own measure number).  The map starts
+    at tick 0 in 4/4 unless an event there overrides it.
+    """
+    segments: List[Tuple[int, int, int]] = [(0, *DEFAULT_TIME_SIGNATURE)]
+    for event in events:  # ticks are non-decreasing within a track
+        num, den = event.numerator, event.denominator
+        if event.tick == segments[-1][0]:
+            segments[-1] = (event.tick, num, den)  # last declaration wins
+        elif event.tick > segments[-1][0]:
+            segments.append((event.tick, num, den))
+    return segments
+
+
+def _ceil_div(numerator: Fraction, denominator: Fraction) -> int:
+    return -((-numerator) // denominator)
+
+
+def musical_position_at_tick(
+    tick: int, segments: List[Tuple[int, int, int]], ppqn: int
+) -> Tuple[int, int, int, Fraction]:
+    """Return ``(measure, numerator, denominator, beat)`` for ``tick``.
+
+    ``measure`` is one-based; ``beat`` is the one-based beat position within
+    the current measure as a reduced fraction (the downbeat is ``1/1``).
+    The meter ``(numerator, denominator)`` is the one in force at the tick.
+    Beats are denominator-note beats, so in 4/4 one beat spans one quarter
+    note (``4*ppqn/denominator`` ticks) regardless of PPQN; fractional-tick
+    beat grids are handled exactly via :class:`Fraction`.
+    """
+    # Locate the segment in force at tick (a change takes effect at its tick).
+    idx = 0
+    for i, (seg_start, _, _) in enumerate(segments):
+        if seg_start <= tick:
+            idx = i
+        else:
+            break
+    seg_start, num, den = segments[idx]
+
+    # Count the one-based measures already finished.  Every earlier segment
+    # starts on a bar boundary (a mid-bar change truncates the prior bar,
+    # which still counts), contributing ceil(span / bar_length) measures.
+    measure = 1
+    for i in range(idx):
+        prev_start, prev_num, prev_den = segments[i]
+        bar_ticks = Fraction(prev_num * 4 * ppqn, prev_den)
+        span = segments[i + 1][0] - prev_start
+        measure += _ceil_div(Fraction(span), bar_ticks)
+
+    bar_ticks = Fraction(num * 4 * ppqn, den)
+    beat_ticks = Fraction(4 * ppqn, den)
+    offset = tick - seg_start
+    measure += offset // bar_ticks
+    beat = Fraction(1) + Fraction(offset % bar_ticks) / beat_ticks
+    return measure, num, den, beat
+
+
+def normalize(data: bytes, *, musical_position: bool = False) -> dict:
+    """Parse ``data`` and return the normalized channel-event timeline.
+
+    With ``musical_position`` the time-signature meta events are strictly
+    validated (raising :class:`MidiError` at the offending byte offset) and
+    every event additionally carries its one-based measure, the meter in
+    force and its one-based reduced-fraction beat position.
+    """
+    parsed = parse(data, strict_time_signatures=musical_position)
     segments = build_tempo_segments(parsed.tempo_events)
+    metric_segments = (
+        build_metric_segments(parsed.time_signature_events)
+        if musical_position
+        else None
+    )
     ordered = sorted(
         parsed.channel_events, key=lambda e: (e.tick, e.track, e.order)
     )
     events = []
     for event in ordered:
         moment = time_at_tick(event.tick, segments, parsed.ppqn)
-        events.append(
-            {
-                "tick": event.tick,
-                "track": event.track,
-                "order": event.order,
-                "type": CHANNEL_EVENT_NAMES[event.kind],
-                "channel": event.channel,
-                "data": list(event.data),
-                "time_us": {
-                    "numerator": moment.numerator,
-                    "denominator": moment.denominator,
-                    "fraction": f"{moment.numerator}/{moment.denominator}",
+        entry = {
+            "tick": event.tick,
+            "track": event.track,
+            "order": event.order,
+            "type": CHANNEL_EVENT_NAMES[event.kind],
+            "channel": event.channel,
+            "data": list(event.data),
+            "time_us": {
+                "numerator": moment.numerator,
+                "denominator": moment.denominator,
+                "fraction": f"{moment.numerator}/{moment.denominator}",
+            },
+        }
+        if musical_position:
+            measure, num, den, beat = musical_position_at_tick(
+                event.tick, metric_segments, parsed.ppqn
+            )
+            entry["musical_position"] = {
+                "measure": measure,
+                "time_signature": {"numerator": num, "denominator": den},
+                "beat": {
+                    "numerator": beat.numerator,
+                    "denominator": beat.denominator,
+                    "fraction": f"{beat.numerator}/{beat.denominator}",
                 },
             }
-        )
+        events.append(entry)
     return {
         "format": parsed.fmt,
         "ppqn": parsed.ppqn,

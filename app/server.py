@@ -10,10 +10,12 @@ from __future__ import annotations
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 from .midi import MAX_FILE_BYTES, MidiError, normalize
 
 NORMALIZE_PATH = "/api/midi/normalize"
+MUSICAL_POSITION_PROJECTION = "musical_position"
 _DRAIN_CAP = 32 << 20  # never read more than this when rejecting oversize bodies
 
 
@@ -63,10 +65,24 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "not_found", f"unknown path: {path}")
 
     def do_POST(self) -> None:
-        path = self.path.split("?", 1)[0]
+        path, _, query_string = self.path.partition("?")
         if path != NORMALIZE_PATH:
             self._error(404, "not_found", f"unknown path: {path}")
             return
+
+        projection = None
+        if query_string:
+            params = parse_qs(query_string, strict_parsing=False)
+            values = params.get("projection")
+            if values:
+                projection = values[-1]
+                if projection != MUSICAL_POSITION_PROJECTION:
+                    self._error(
+                        400,
+                        "invalid_projection",
+                        "projection must be 'musical_position' when supplied",
+                    )
+                    return
 
         length_header = self.headers.get("Content-Length")
         if length_header is None:
@@ -102,7 +118,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = normalize(body)
+            result = normalize(
+                body, musical_position=projection == MUSICAL_POSITION_PROJECTION
+            )
         except MidiError as exc:
             # Structural failure: report the locating offset, never a
             # partial timeline.
