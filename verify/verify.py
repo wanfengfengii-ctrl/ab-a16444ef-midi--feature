@@ -1,10 +1,13 @@
 """One-shot verification service.
 
 Runs, in order:
-  1. code tests   -- the unit-test suite (stdlib unittest)
-  2. build check  -- byte-compile every source tree and import the modules
-  3. API smoke    -- POST a multi-track, tempo-changing format-1 file plus
-                     structural-error cases to a healthy app container
+  1. code tests       -- the unit-test suite (stdlib unittest)
+  2. build check      -- byte-compile every source tree and import the modules
+  3. app health       -- wait for the app container to answer /health
+  4. API smoke        -- POST a multi-track, tempo-changing format-1 file plus
+                         structural-error cases (the PPQN regression)
+  5. projection smoke -- POST a mid-measure time-signature-change file with
+                         ?projection=musical_position plus validation cases
 
 Every step is reported on stdout; the process exit code is 0 only when all
 steps pass, so `docker compose up --exit-code-from verify verify` surfaces
@@ -51,6 +54,10 @@ def header(fmt, ntracks, division):
 
 def tempo(delta, us):
     return varlen(delta) + bytes([0xFF, 0x51, 0x03]) + us.to_bytes(3, "big")
+
+
+def sig(delta, nn, dd, cc=0x24, bb=0x08):
+    return varlen(delta) + bytes([0xFF, 0x58, 0x04, nn, dd, cc, bb])
 
 
 def ev(delta, *bs):
@@ -105,12 +112,47 @@ EXPECTED_EVENTS = [
 ]
 
 
+def build_projection_file():
+    """Format 1, PPQN 480: 4/4, then 3/4 declared at tick 1440 -- mid-way
+    through the first measure -- with a same-tick 5/4 decoy that must lose
+    to the later 3/4.  The short first measure still counts.
+    """
+    conductor = (
+        sig(0, 4, 2)
+        + sig(1440, 5, 2)
+        + sig(0, 3, 2)  # absolute tick 1440; same tick -> last wins
+        + EOT
+    )
+    notes = (
+        ev(0, 0x90, 60, 100)      # tick 0
+        + ev(480, 0x80, 60, 0)    # tick 480
+        + ev(960, 0x90, 62, 100)  # tick 1440
+        + ev(720, 0x80, 62, 0)    # tick 2160
+        + ev(720, 0x90, 64, 100)  # tick 2880
+        + ev(1440, 0x80, 64, 0)   # tick 4320
+        + EOT
+    )
+    return header(1, 2, 480) + track(conductor) + track(notes)
+
+
+# Expected musical positions for build_projection_file():
+# (tick, measure, signature, beat-fraction).
+EXPECTED_POSITIONS = [
+    (0, 1, "4/4", "1/1"),
+    (480, 1, "4/4", "2/1"),
+    (1440, 2, "3/4", "1/1"),
+    (2160, 2, "3/4", "5/2"),
+    (2880, 3, "3/4", "1/1"),
+    (4320, 4, "3/4", "1/1"),
+]
+
+
 # -- helpers -----------------------------------------------------------------
 
 
-def post(body):
+def post(body, query=""):
     request = urllib.request.Request(
-        APP_URL + "/api/midi/normalize",
+        APP_URL + "/api/midi/normalize" + query,
         data=body,
         headers={"Content-Type": "application/octet-stream"},
         method="POST",
@@ -153,7 +195,7 @@ class Suite:
 
 
 def step_unit_tests():
-    print("[1/4] code tests: unittest suite", flush=True)
+    print("[1/5] code tests: unittest suite", flush=True)
     result = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", ".", "-v"],
         capture_output=True,
@@ -166,7 +208,7 @@ def step_unit_tests():
 
 
 def step_build_check():
-    print("[2/4] build check: byte-compile and import all modules", flush=True)
+    print("[2/5] build check: byte-compile and import all modules", flush=True)
     result = subprocess.run(
         [sys.executable, "-m", "compileall", "-q", "app", "tests", "verify"],
         capture_output=True,
@@ -186,14 +228,14 @@ def step_build_check():
 
 
 def step_wait_for_app():
-    print(f"[3/4] waiting for app health at {APP_URL}/health", flush=True)
+    print(f"[3/5] waiting for app health at {APP_URL}/health", flush=True)
     ok = wait_for_app()
     print("      healthy" if ok else "      NOT healthy", flush=True)
     return ok
 
 
 def step_api_smoke():
-    print("[4/4] API smoke: multi-track tempo-changing file + error cases",
+    print("[4/5] API smoke: multi-track tempo-changing file + error cases",
           flush=True)
     suite = Suite()
 
@@ -277,6 +319,88 @@ def step_api_smoke():
     return not suite.failures
 
 
+def step_projection_smoke():
+    print("[5/5] projection smoke: musical_position across a mid-measure "
+          "time-signature change", flush=True)
+    suite = Suite()
+    query = "?projection=musical_position"
+
+    # -- happy path: measures/beats across a mid-measure signature change --
+    status, body = post(build_projection_file(), query)
+    suite.check("status 200", status == 200, f"got {status}: {body}")
+    if status != 200:
+        return False
+    events = body.get("events", [])
+    suite.check("6 events returned", len(events) == 6, f"got {len(events)}")
+    for i, (tick, measure, signature, beat) in enumerate(EXPECTED_POSITIONS):
+        if i >= len(events):
+            break
+        got = events[i]
+        pos = got.get("musical_position", {})
+        suite.check(f"event {i} tick {tick}", got.get("tick") == tick,
+                    f"got {got.get('tick')}")
+        suite.check(f"event {i} measure {measure}",
+                    pos.get("measure") == measure, f"got {pos.get('measure')}")
+        suite.check(
+            f"event {i} signature {signature}",
+            pos.get("time_signature", {}).get("signature") == signature,
+            f"got {pos.get('time_signature')}",
+        )
+        suite.check(
+            f"event {i} beat {beat}",
+            pos.get("beat", {}).get("fraction") == beat,
+            f"got {pos.get('beat')}",
+        )
+        suite.check(f"event {i} keeps exact time_us", "time_us" in got)
+
+    # -- omitted projection: the response stays projection-free -------------
+    status, body = post(build_projection_file())
+    suite.check("no projection: status 200", status == 200, f"got {status}")
+    suite.check(
+        "no projection: no musical_position keys",
+        all("musical_position" not in e for e in body.get("events", [])),
+    )
+
+    # -- unknown projection value -------------------------------------------
+    status, body = post(build_projection_file(), "?projection=bogus")
+    suite.check("unknown projection: HTTP 400", status == 400,
+                f"got {status}")
+    suite.check(
+        "unknown projection: code",
+        body.get("error", {}).get("code") == "unknown_projection",
+        f"got {body}",
+    )
+
+    # -- signature validation: only when the projection is enabled ----------
+    bad_length = header(0, 1, 480) + track(
+        ev(0, 0xFF, 0x58, 0x03, 0x04, 0x02, 0x24) + EOT
+    )
+    zero_numerator = header(0, 1, 480) + track(sig(0, 0, 2) + EOT)
+    big_exponent = header(0, 1, 480) + track(sig(0, 4, 8) + EOT)
+    cases = [
+        ("3-byte time signature", bad_length, "bad_meta_length"),
+        ("zero numerator", zero_numerator, "invalid_time_signature"),
+        ("denominator exponent 8", big_exponent, "invalid_time_signature"),
+    ]
+    for label, payload, code in cases:
+        status, body = post(payload, query)
+        err = body.get("error", {})
+        suite.check(f"{label}: HTTP 400", status == 400, f"got {status}")
+        suite.check(f"{label}: code {code}", err.get("code") == code,
+                    f"got {err.get('code')}")
+        suite.check(
+            f"{label}: locating offset",
+            isinstance(err.get("offset"), int) and err["offset"] >= 0,
+            f"got {err.get('offset')}",
+        )
+        suite.check(f"{label}: no partial timeline", "events" not in body)
+        status, body = post(payload)
+        suite.check(f"{label}: accepted without projection", status == 200,
+                    f"got {status}")
+
+    return not suite.failures
+
+
 def main():
     print(f"verify: target app at {APP_URL}", flush=True)
     steps = [
@@ -284,6 +408,7 @@ def main():
         ("build check", step_build_check),
         ("app health", step_wait_for_app),
         ("api smoke", step_api_smoke),
+        ("projection smoke", step_projection_smoke),
     ]
     failed = []
     for name, fn in steps:

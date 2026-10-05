@@ -6,11 +6,14 @@ from fractions import Fraction
 from app.midi import (
     MAX_TRACKS_PLUS_EVENTS,
     MidiError,
+    build_measure_map,
     build_tempo_segments,
+    musical_position,
     normalize,
     parse,
     time_at_tick,
     TempoEvent,
+    TimeSignatureEvent,
 )
 
 
@@ -44,6 +47,10 @@ def tempo(delta, us):
     return varlen(delta) + bytes([0xFF, 0x51, 0x03]) + us.to_bytes(3, "big")
 
 
+def sig(delta, nn, dd, cc=0x24, bb=0x08):
+    return varlen(delta) + bytes([0xFF, 0x58, 0x04, nn, dd, cc, bb])
+
+
 def ev(delta, *bs):
     return varlen(delta) + bytes(bs)
 
@@ -54,6 +61,17 @@ EOT = ev(0, 0xFF, 0x2F, 0x00)
 def fractions(result):
     return [Fraction(e["time_us"]["numerator"], e["time_us"]["denominator"])
             for e in result["events"]]
+
+
+def positions(result):
+    return [
+        (
+            e["musical_position"]["measure"],
+            e["musical_position"]["time_signature"]["signature"],
+            e["musical_position"]["beat"]["fraction"],
+        )
+        for e in result["events"]
+    ]
 
 
 # -- header / chunk validation --------------------------------------------
@@ -365,6 +383,213 @@ class OrderingTests(unittest.TestCase):
             fractions(result),
             [Fraction(0)] + [Fraction(125000)] + [Fraction(250000)] * 3,
         )
+
+
+# -- musical position projection --------------------------------------------
+
+
+class MusicalPositionTests(unittest.TestCase):
+    def test_default_4_4(self):
+        payload = (
+            ev(0, 0x90, 60, 100)
+            + ev(480, 0x90, 62, 100)
+            + ev(1440, 0x90, 64, 100)  # tick 1920
+            + ev(480, 0x90, 65, 100)   # tick 2400
+            + EOT
+        )
+        result = normalize(
+            header(0, 1, 480) + track(payload),
+            projection="musical_position",
+        )
+        self.assertEqual(
+            positions(result),
+            [
+                (1, "4/4", "1/1"),
+                (1, "4/4", "2/1"),
+                (2, "4/4", "1/1"),
+                (2, "4/4", "2/1"),
+            ],
+        )
+
+    def test_beat_fraction_is_reduced(self):
+        payload = ev(240, 0x90, 60, 100) + EOT
+        result = normalize(
+            header(0, 1, 480) + track(payload),
+            projection="musical_position",
+        )
+        beat = result["events"][0]["musical_position"]["beat"]
+        self.assertEqual((beat["numerator"], beat["denominator"]), (3, 2))
+        self.assertEqual(beat["fraction"], "3/2")
+
+    def test_mid_measure_change_opens_new_measure(self):
+        conductor = sig(0, 4, 2) + sig(1440, 3, 2) + EOT
+        notes = (
+            ev(0, 0x90, 60, 100)       # tick 0    -> M1, 4/4, beat 1
+            + ev(1440, 0x90, 62, 100)  # tick 1440 -> M2, 3/4, beat 1
+            + ev(720, 0x90, 64, 100)   # tick 2160 -> M2, beat 5/2
+            + ev(720, 0x90, 65, 100)   # tick 2880 -> M3, beat 1
+            + EOT
+        )
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, projection="musical_position")
+        self.assertEqual(
+            positions(result),
+            [
+                (1, "4/4", "1/1"),
+                (2, "3/4", "1/1"),
+                (2, "3/4", "5/2"),
+                (3, "3/4", "1/1"),
+            ],
+        )
+
+    def test_incomplete_measure_still_counts(self):
+        # 3/4 declared one beat into the 4/4 first measure: measure 1 is
+        # short but still counts, so the change opens measure 2.
+        conductor = sig(480, 3, 2) + EOT
+        notes = ev(0, 0x90, 60, 100) + ev(480, 0x90, 62, 100) + EOT
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, projection="musical_position")
+        got = [(measure, beat) for measure, _, beat in positions(result)]
+        self.assertEqual(got, [(1, "1/1"), (2, "1/1")])
+
+    def test_same_tick_last_signature_wins(self):
+        conductor = sig(960, 5, 2) + sig(0, 3, 2) + EOT  # both at tick 960
+        notes = ev(960, 0x90, 60, 100) + EOT
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, projection="musical_position")
+        pos = result["events"][0]["musical_position"]
+        self.assertEqual(pos["time_signature"]["signature"], "3/4")
+        self.assertEqual(pos["measure"], 2)
+
+    def test_tick_zero_signature_replaces_default(self):
+        conductor = sig(0, 6, 3) + EOT
+        notes = (
+            ev(0, 0x90, 60, 100)
+            + ev(240, 0x90, 62, 100)   # one eighth-note beat later
+            + ev(1200, 0x90, 64, 100)  # tick 1440: measure 2
+            + EOT
+        )
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, projection="musical_position")
+        self.assertEqual(
+            positions(result),
+            [(1, "6/8", "1/1"), (1, "6/8", "2/1"), (2, "6/8", "1/1")],
+        )
+
+    def test_format_1_ignores_non_first_track_signatures(self):
+        conductor = sig(0, 4, 2) + EOT
+        notes = sig(0, 6, 3) + ev(480, 0x90, 60, 100) + EOT  # decoy 6/8
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        result = normalize(data, projection="musical_position")
+        pos = result["events"][0]["musical_position"]
+        self.assertEqual(pos["time_signature"]["signature"], "4/4")
+        self.assertEqual((pos["measure"], pos["beat"]["fraction"]), (1, "2/1"))
+
+    def test_format_0_uses_own_signatures(self):
+        payload = sig(0, 3, 2) + ev(1440, 0x90, 60, 100) + EOT
+        result = normalize(
+            header(0, 1, 480) + track(payload),
+            projection="musical_position",
+        )
+        pos = result["events"][0]["musical_position"]
+        self.assertEqual(
+            (pos["measure"], pos["time_signature"]["signature"]), (2, "3/4")
+        )
+
+    def test_denominator_exponent_bounds(self):
+        # Exponents 0 (whole-note beat) and 7 (128th-note beat) are accepted.
+        for dd in (0, 7):
+            payload = sig(0, 3, dd) + ev(0, 0x90, 60, 100) + EOT
+            result = normalize(
+                header(0, 1, 480) + track(payload),
+                projection="musical_position",
+            )
+            pos = result["events"][0]["musical_position"]
+            self.assertEqual(pos["time_signature"]["denominator"], 1 << dd)
+
+    def test_no_projection_no_position_keys(self):
+        payload = sig(0, 3, 2) + ev(0, 0x90, 60, 100) + EOT
+        result = normalize(header(0, 1, 480) + track(payload))
+        self.assertNotIn("musical_position", result["events"][0])
+
+
+class TimeSignatureValidationTests(unittest.TestCase):
+    def test_bad_length_rejected_with_projection(self):
+        payload = ev(0, 0xFF, 0x58, 0x03, 0x04, 0x02, 0x24) + EOT
+        data = header(0, 1, 480) + track(payload)
+        with self.assertRaises(MidiError) as ctx:
+            normalize(data, projection="musical_position")
+        self.assertEqual(ctx.exception.code, "bad_meta_length")
+        self.assertIsInstance(ctx.exception.offset, int)
+
+    def test_bad_length_accepted_without_projection(self):
+        payload = (
+            ev(0, 0xFF, 0x58, 0x03, 0x04, 0x02, 0x24)
+            + ev(0, 0x90, 60, 100)
+            + EOT
+        )
+        result = normalize(header(0, 1, 480) + track(payload))
+        self.assertEqual(result["channel_event_count"], 1)
+        self.assertNotIn("musical_position", result["events"][0])
+
+    def test_zero_numerator_rejected(self):
+        payload = sig(0, 0, 2) + EOT
+        with self.assertRaises(MidiError) as ctx:
+            normalize(
+                header(0, 1, 480) + track(payload),
+                projection="musical_position",
+            )
+        self.assertEqual(ctx.exception.code, "invalid_time_signature")
+
+    def test_denominator_exponent_above_7_rejected(self):
+        payload = sig(0, 4, 8) + EOT
+        with self.assertRaises(MidiError) as ctx:
+            normalize(
+                header(0, 1, 480) + track(payload),
+                projection="musical_position",
+            )
+        self.assertEqual(ctx.exception.code, "invalid_time_signature")
+
+    def test_invalid_signature_in_any_track_rejected(self):
+        # Format 1 uses only track 0 for the map, but malformed signature
+        # events anywhere are rejected, mirroring tempo strictness.
+        conductor = EOT
+        notes = sig(0, 0, 2) + ev(0, 0x90, 60, 100) + EOT
+        data = header(1, 2, 480) + track(conductor) + track(notes)
+        with self.assertRaises(MidiError) as ctx:
+            normalize(data, projection="musical_position")
+        self.assertEqual(ctx.exception.code, "invalid_time_signature")
+
+    def test_error_reports_locating_offset(self):
+        payload = ev(0, 0x90, 60, 100) + sig(0, 4, 9) + EOT
+        data = header(0, 1, 480) + track(payload)
+        with self.assertRaises(MidiError) as ctx:
+            normalize(data, projection="musical_position")
+        # 14-byte header + 8-byte MTrk header + 4-byte note + 1-byte delta
+        # lands on the 0xFF status byte of the signature meta event.
+        self.assertEqual(ctx.exception.offset, 14 + 8 + 4 + 1)
+
+
+class MeasureMapTests(unittest.TestCase):
+    def test_build_measure_map_default(self):
+        self.assertEqual(build_measure_map([], 480), [(0, 1, 4, 4)])
+
+    def test_measure_numbers_across_changes(self):
+        events = [
+            TimeSignatureEvent(1440, 3, 2),
+            TimeSignatureEvent(2880, 6, 3),
+        ]
+        # 4/4 covers [0, 1440): one incomplete measure; 3/4 covers
+        # [1440, 2880): exactly one full measure; 6/8 starts measure 3.
+        self.assertEqual(
+            build_measure_map(events, 480),
+            [(0, 1, 4, 4), (1440, 2, 3, 4), (2880, 3, 6, 8)],
+        )
+
+    def test_musical_position_exact_beat(self):
+        measure_map = build_measure_map([TimeSignatureEvent(1920, 3, 2)], 480)
+        measure, nn, dd, beat = musical_position(1920 + 960, measure_map, 480)
+        self.assertEqual((measure, nn, dd, beat), (2, 3, 4, Fraction(3, 1)))
 
 
 if __name__ == "__main__":

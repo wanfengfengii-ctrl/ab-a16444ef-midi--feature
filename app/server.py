@@ -2,7 +2,9 @@
 
 Exposes ``POST /api/midi/normalize`` (raw SMF bytes in, JSON timeline out)
 and ``GET /health``.  Standard library only, so the image builds with no
-package installation step.
+package installation step.  The optional query parameter
+``projection=musical_position`` adds a measure/beat projection to every
+channel event; omitting it keeps the original response shape.
 """
 
 from __future__ import annotations
@@ -10,10 +12,12 @@ from __future__ import annotations
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 from .midi import MAX_FILE_BYTES, MidiError, normalize
 
 NORMALIZE_PATH = "/api/midi/normalize"
+MUSICAL_POSITION_PROJECTION = "musical_position"
 _DRAIN_CAP = 32 << 20  # never read more than this when rejecting oversize bodies
 
 
@@ -63,10 +67,24 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "not_found", f"unknown path: {path}")
 
     def do_POST(self) -> None:
-        path = self.path.split("?", 1)[0]
-        if path != NORMALIZE_PATH:
-            self._error(404, "not_found", f"unknown path: {path}")
+        url = urlsplit(self.path)
+        if url.path != NORMALIZE_PATH:
+            self._error(404, "not_found", f"unknown path: {url.path}")
             return
+
+        projection = None
+        params = parse_qs(url.query, keep_blank_values=True)
+        if "projection" in params:
+            value = params["projection"][0]
+            if value != MUSICAL_POSITION_PROJECTION:
+                self._error(
+                    400,
+                    "unknown_projection",
+                    f"unsupported projection {value!r}; only "
+                    f"'{MUSICAL_POSITION_PROJECTION}' is defined",
+                )
+                return
+            projection = value
 
         length_header = self.headers.get("Content-Length")
         if length_header is None:
@@ -102,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = normalize(body)
+            result = normalize(body, projection=projection)
         except MidiError as exc:
             # Structural failure: report the locating offset, never a
             # partial timeline.
